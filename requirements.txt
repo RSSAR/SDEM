@@ -1,0 +1,4 @@
+sardem==0.13.0
+requests>=2.28
+h5py>=3.8
+shapely>=2.0
