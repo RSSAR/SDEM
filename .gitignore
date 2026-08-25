@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# FUSE / temporary download files
+.fuse_hidden*
+*.tmp
+*.part
+*.aria2
+
+# SAR data
+*.SAFE/
+*.h5
+*.H5
+*.zip
+
+# DEM products and sidecars
+*.wgs84
+*.wgs84.*
+dem.hdr
+dem.tif
+dem.tif.*
+elevation.tif
+elevation.tif.*
+elevation.dem
+elevation.dem.*
+*.aux.xml
+
+# Local caches
+.cache/
+cache/
