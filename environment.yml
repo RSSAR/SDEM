@@ -1,0 +1,14 @@
+name: sdem
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal
+  - proj
+  - aria2
+  - h5py
+  - shapely
+  - requests
+  - pip
+  - pip:
+      - sardem==0.13.0
