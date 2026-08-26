@@ -2,31 +2,25 @@
 # -*- coding: utf-8 -*-
 """sdem.py - fast SAR DEM downloader powered by sardem + aria2.
 
-The script intentionally leaves DEM science/geometry processing to sardem.
-It only adds two conveniences:
-
-1. Auto-detect a lon/lat extent from Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5.
-2. Prefetch the required Copernicus GLO-30 COG tiles with aria2c into a
-   persistent local cache, build a local VRT, then pass that VRT to sardem.
+SDEM auto-detects the geographic extent of Sentinel-1 SAFE/ZIP products or
+NISAR RSLC HDF5 products, prefetches the required Copernicus GLO-30 tiles with
+aria2, builds a persistent local VRT, and delegates final DEM generation to
+sardem.
 
 Typical use
 -----------
     python sdem.py ../SLC
+    python sdem.py ../RSLC
 
-If ../SLC contains Sentinel-1 SAFE/ZIP products, output defaults to an ISCE2
-DEM (dem.wgs84 + XML). If it contains NISAR RSLC .h5 products, output defaults
-to an ISCE3 GeoTIFF (dem.tif).
-
-You can override detection with:
-    --format isce2 | isce3 | both
-
-All pixel-grid alignment, resampling, nodata handling, and EGM2008 -> WGS84
-ellipsoidal-height conversion remain inside sardem.
+Auto mode:
+    Sentinel-1 -> ISCE2 DEM (dem.wgs84 + XML)
+    NISAR RSLC -> ISCE3 GeoTIFF (dem.tif)
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -50,8 +44,7 @@ COP30_RES = 1.0 / 3600.0
 COP30_HALF_PIXEL = 0.5 * COP30_RES
 
 BBox = Tuple[float, float, float, float]
-
-SDEM_VERSION = "1.0.2"
+SDEM_VERSION = "1.0.3"
 
 BANNER = r"""
    ███████╗██████╗ ███████╗███╗   ███╗
@@ -86,9 +79,8 @@ def print_banner() -> None:
 
 
 def _setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -394,26 +386,175 @@ def _decode_h5_scalar(value) -> str:
     return str(value)
 
 
+def _h5_scalar(group, name: str) -> str | None:
+    obj = group.get(name) if group is not None else None
+    if obj is None:
+        return None
+    try:
+        return _decode_h5_scalar(obj[()]).strip()
+    except Exception:
+        return None
+
+
+def _nisar_rslc_identity(f, path: Path) -> tuple[bool, str]:
+    ident = f.get("/science/LSAR/identification")
+    rslc = f.get("/science/LSAR/RSLC")
+    product_type = (_h5_scalar(ident, "productType") or "").upper()
+    mission = (_h5_scalar(ident, "missionId") or "").upper()
+    name = path.name.upper()
+
+    signals = []
+    if "RSLC" in product_type:
+        signals.append(f"productType={product_type}")
+    if rslc is not None:
+        signals.append("/science/LSAR/RSLC present")
+    if mission == "NISAR":
+        signals.append("missionId=NISAR")
+    if name.startswith("NISAR_") and "_RSLC_" in name:
+        signals.append("RSLC granule filename")
+
+    recognized = rslc is not None and (
+        "RSLC" in product_type
+        or mission == "NISAR"
+        or (name.startswith("NISAR_") and "_RSLC_" in name)
+        or ident is None
+    )
+    if not recognized and "RSLC" in product_type:
+        recognized = True
+    return recognized, ", ".join(signals) or "no NISAR RSLC markers"
+
+
+def _geometry_lonlat_pairs(obj) -> tuple[List[float], List[float]]:
+    lons: List[float] = []
+    lats: List[float] = []
+
+    def walk(node):
+        if isinstance(node, (list, tuple)):
+            if len(node) >= 2 and all(isinstance(v, (int, float)) for v in node[:2]):
+                lons.append(float(node[0]))
+                lats.append(float(node[1]))
+            else:
+                for child in node:
+                    walk(child)
+
+    if isinstance(obj, dict):
+        walk(obj.get("coordinates", []))
+    return lons, lats
+
+
+def _extent_from_polygon_text(text: str) -> BBox:
+    text = text.strip()
+    if not text:
+        raise ValueError("empty boundingPolygon")
+
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            lons, lats = _geometry_lonlat_pairs(obj)
+            if lons and lats:
+                return _robust_extent(lons, lats)
+        except Exception:
+            pass
+
+    try:
+        from shapely import wkt
+
+        geom = wkt.loads(text)
+        if not geom.is_empty:
+            minx, miny, maxx, maxy = geom.bounds
+            return float(minx), float(miny), float(maxx), float(maxy)
+    except Exception:
+        pass
+
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    pairs = re.findall(rf"({number})\s+({number})", text)
+    if pairs:
+        lons = [float(x) for x, _ in pairs]
+        lats = [float(y) for _, y in pairs]
+        if all(-90.0001 <= y <= 90.0001 for y in lats):
+            return _robust_extent(lons, lats)
+
+    raise ValueError("boundingPolygon is neither usable WKT nor GeoJSON")
+
+
+def _finite_h5_values(dataset) -> List[float]:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("numpy is required for NISAR geolocation-grid fallback") from exc
+
+    arr = np.asarray(dataset[...], dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return []
+    return arr.ravel().tolist()
+
+
+def _extent_from_nisar_geolocation_grid(f) -> BBox:
+    grid = f.get("/science/LSAR/RSLC/metadata/geolocationGrid")
+    if grid is None:
+        raise KeyError("/science/LSAR/RSLC/metadata/geolocationGrid is missing")
+    x = grid.get("coordinateX")
+    y = grid.get("coordinateY")
+    if x is None or y is None:
+        raise KeyError("geolocationGrid coordinateX/coordinateY is missing")
+
+    lons_all = _finite_h5_values(x)
+    lats_all = _finite_h5_values(y)
+    if not lons_all or not lats_all:
+        raise ValueError("geolocationGrid coordinateX/coordinateY contains no finite values")
+
+    lons = [v for v in lons_all if -360.1 <= v <= 360.1]
+    lats = [v for v in lats_all if -90.1 <= v <= 90.1]
+    if not lons or not lats:
+        raise ValueError(
+            "geolocationGrid coordinateX/coordinateY do not contain usable longitude/latitude degrees"
+        )
+    return _robust_extent(lons, lats)
+
+
 def _extent_from_nisar_h5(path: Path) -> BBox:
     try:
         import h5py
     except ImportError as exc:
-        raise RuntimeError("h5py is required for NISAR RSLC detection") from exc
-
-    with h5py.File(path, "r") as f:
-        base = "/science/LSAR/identification"
-        product_type = _decode_h5_scalar(f[f"{base}/productType"][()]).strip().upper()
-        if "RSLC" not in product_type:
-            raise RuntimeError(f"Not a NISAR RSLC product: {path}")
-        wkt_text = _decode_h5_scalar(f[f"{base}/boundingPolygon"][()]).strip()
+        raise RuntimeError(
+            "h5py is required for NISAR RSLC detection. Install it with: "
+            "python -m pip install h5py"
+        ) from exc
 
     try:
-        from shapely import wkt
-    except ImportError as exc:
-        raise RuntimeError("shapely is required for NISAR boundingPolygon parsing") from exc
-    geom = wkt.loads(wkt_text)
-    minx, miny, maxx, maxy = geom.bounds
-    return float(minx), float(miny), float(maxx), float(maxy)
+        f = h5py.File(path, "r")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot open HDF5 file: {exc}") from exc
+
+    with f:
+        recognized, identity = _nisar_rslc_identity(f, path)
+        if not recognized:
+            raise RuntimeError(f"Not recognized as NISAR RSLC ({identity})")
+
+        ident = f.get("/science/LSAR/identification")
+        polygon_error = None
+        polygon_text = _h5_scalar(ident, "boundingPolygon")
+        if polygon_text:
+            try:
+                bbox = _extent_from_polygon_text(polygon_text)
+                LOG.debug("NISAR footprint from boundingPolygon: %s", path.name)
+                return bbox
+            except Exception as exc:
+                polygon_error = exc
+
+        try:
+            bbox = _extent_from_nisar_geolocation_grid(f)
+            LOG.debug("NISAR footprint from RSLC geolocationGrid: %s", path.name)
+            return bbox
+        except Exception as grid_exc:
+            details = []
+            if not polygon_text:
+                details.append("identification/boundingPolygon missing")
+            elif polygon_error is not None:
+                details.append(f"boundingPolygon unusable: {polygon_error}")
+            details.append(f"geolocationGrid fallback failed: {grid_exc}")
+            raise RuntimeError("; ".join(details)) from grid_exc
 
 
 def _robust_extent(lons: Sequence[float], lats: Sequence[float]) -> BBox:
@@ -448,6 +589,17 @@ def _merge_extents(extents: Sequence[BBox]) -> BBox:
     return left, min(lats_bottom), right, max(lats_top)
 
 
+def _format_failures(failures: Sequence[tuple[Path, Exception]], limit: int = 5) -> str:
+    if not failures:
+        return ""
+    lines = []
+    for path, exc in failures[:limit]:
+        lines.append(f"  - {path.name}: {type(exc).__name__}: {exc}")
+    if len(failures) > limit:
+        lines.append(f"  ... and {len(failures) - limit} more")
+    return "\n".join(lines)
+
+
 def detect_sar_extent(path: Path) -> Tuple[str, BBox, int]:
     path = path.expanduser().resolve()
     if not path.exists():
@@ -466,31 +618,54 @@ def detect_sar_extent(path: Path) -> Tuple[str, BBox, int]:
 
     if safes or zips:
         extents: List[BBox] = []
+        failures: List[tuple[Path, Exception]] = []
         for p in safes:
             try:
                 extents.append(_extent_from_safe_dir(p))
             except Exception as exc:
+                failures.append((p, exc))
                 LOG.debug("Skipping %s: %s", p, exc)
         for p in zips:
             try:
                 extents.append(_extent_from_s1_zip(p))
             except Exception as exc:
+                failures.append((p, exc))
                 LOG.debug("Skipping %s: %s", p, exc)
         if not extents:
-            raise RuntimeError("Sentinel-1 products found but none yielded a valid footprint")
-        LOG.info("Found %d Sentinel-1 product(s)", len(safes) + len(zips))
+            msg = "Sentinel-1 products found but none yielded a valid footprint"
+            details = _format_failures(failures)
+            if details:
+                msg += "\n" + details
+            raise RuntimeError(msg)
+        LOG.info("Found %d usable Sentinel-1 product(s)", len(extents))
         return "sentinel1", _merge_extents(extents), len(extents)
 
     if h5s:
-        extents = []
+        extents: List[BBox] = []
+        failures: List[tuple[Path, Exception]] = []
         for p in h5s:
             try:
                 extents.append(_extent_from_nisar_h5(p))
             except Exception as exc:
+                failures.append((p, exc))
                 LOG.debug("Skipping %s: %s", p, exc)
         if not extents:
-            raise RuntimeError("HDF5 files found but no NISAR RSLC product was recognized")
-        LOG.info("Found %d NISAR RSLC product(s)", len(extents))
+            msg = (
+                f"Found {len(h5s)} HDF5 file(s), but no usable NISAR RSLC footprint was extracted.\n"
+                "Reasons from the first file(s):"
+            )
+            details = _format_failures(failures)
+            if details:
+                msg += "\n" + details
+            msg += (
+                "\nRun again with -v for debug logging. If these are subset/repacked RSLC files, "
+                "they must retain either identification/boundingPolygon or "
+                "RSLC/metadata/geolocationGrid/coordinateX and coordinateY."
+            )
+            raise RuntimeError(msg)
+        if failures:
+            LOG.warning("Skipped %d non-usable HDF5 file(s); use -v for details", len(failures))
+        LOG.info("Found %d usable NISAR RSLC product(s)", len(extents))
         return "nisar", _merge_extents(extents), len(extents)
 
     raise RuntimeError(f"No Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5 found under {path}")
@@ -627,8 +802,8 @@ Examples:
   # More aria2 parallel downloads
   python sdem.py ../RSLC --aria2-jobs 16 --aria2-connections 4
 
-  # Only download/cache Copernicus tiles and build the local VRT
-  python sdem.py ../RSLC --vrt-only
+  # Diagnose RSLC metadata / footprint parsing
+  python sdem.py ../RSLC -v --vrt-only
 
 Auto mode:
   Sentinel-1 -> ISCE2: dem.wgs84 + dem.wgs84.xml
@@ -643,7 +818,7 @@ Copernicus GLO-30 tile download and provide a persistent local cache.
         description=(
             "Fast Copernicus GLO-30 DEM downloader for Sentinel-1 and NISAR. "
             "It auto-detects the SAR footprint, downloads required tiles with "
-            "aria2, and uses sardem for the final DEM processing."
+            "aria2, and uses sardem for final DEM processing."
         ),
         epilog=examples,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -659,7 +834,7 @@ Copernicus GLO-30 tile download and provide a persistent local cache.
     p.add_argument("--refresh-tile-list", action="store_true", help="Refresh the cached Copernicus tile list")
     p.add_argument("--vrt-only", action="store_true", help="Only prefetch tiles/build local VRT; do not run sardem")
     p.add_argument("--version", action="version", version=f"SDEM {SDEM_VERSION}", help="Show SDEM version and exit")
-    p.add_argument("-v", "--verbose", action="store_true", help="Show verbose/debug logging")
+    p.add_argument("-v", "--verbose", action="store_true", help="Show verbose/debug logging, including skipped HDF5 reasons")
     return p
 
 
