@@ -1,0 +1,122 @@
+--- sdem_v103.py
++++ sdem_v104.py
+@@ -44,7 +44,7 @@
+ COP30_HALF_PIXEL = 0.5 * COP30_RES
+ 
+ BBox = Tuple[float, float, float, float]
+-SDEM_VERSION = "1.0.3"
++SDEM_VERSION = "1.0.4"
+@@ -195,16 +195,45 @@
+     return f"{COP30_BASE_URL}/{name}/{name}.tif"
+ 
+ 
+-def _validate_raster(path: Path) -> bool:
++def _aria2_control_path(path: Path) -> Path:
++    """Return aria2's sidecar control-file path for a download."""
++    return Path(str(path) + ".aria2")
++
++
++def _validate_raster(path: Path, deep: bool = True) -> bool:
++    """Validate a cached DEM tile.
++
++    A partially downloaded GeoTIFF can already contain a valid TIFF header, so
++    merely opening it and checking its dimensions is not sufficient.  When
++    ``deep`` is true, GDAL computes a checksum for every band, forcing the
++    compressed raster blocks to be decoded.  Decode/read failures therefore
++    invalidate the cache before the tile is used in a VRT.
++    """
+     if not path.exists() or path.stat().st_size <= 0:
+         return False
++    if _aria2_control_path(path).exists():
++        # aria2 keeps this sidecar while a download is incomplete.  The partial
++        # .tif must be preserved so the next aria2 invocation can resume it.
++        return False
+     try:
+         gdal = _get_gdal()
+         ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+-        ok = ds is not None and ds.RasterXSize > 0 and ds.RasterYSize > 0
++        if ds is None or ds.RasterXSize <= 0 or ds.RasterYSize <= 0 or ds.RasterCount <= 0:
++            ds = None
++            return False
++        if deep:
++            for band_idx in range(1, ds.RasterCount + 1):
++                band = ds.GetRasterBand(band_idx)
++                if band is None:
++                    ds = None
++                    return False
++                band.Checksum()
+         ds = None
+-        return bool(ok)
+-    except Exception:
++        return True
++    except Exception as exc:
++        LOG.debug("Raster validation failed for %s: %s", path, exc)
+         return False
+@@ -226,17 +255,39 @@
+ 
+     valid: List[Path] = []
+     missing: List[Tuple[str, Path]] = []
++    resume_count = 0
+     for name in names:
+         path = _tile_path(cache_dir, name)
+-        if _validate_raster(path):
+-            valid.append(path)
+-        else:
+-            if path.exists():
+-                path.unlink(missing_ok=True)
++        control = _aria2_control_path(path)
++
++        if control.exists():
++            resume_count += 1
+             missing.append((name, path))
++            LOG.info("aria2: resuming incomplete tile: %s", path.name)
++            continue
++
++        if _validate_raster(path, deep=True):
++            valid.append(path)
++            continue
++
++        if path.exists():
++            LOG.warning("Removing invalid cached tile: %s", path)
++            path.unlink(missing_ok=True)
++        control.unlink(missing_ok=True)
++        missing.append((name, path))
+ 
+     if missing:
+-        LOG.info("aria2: downloading %d COP30 tiles (%d cached)", len(missing), len(valid))
++        LOG.info(
++            "aria2: downloading/resuming %d COP30 tiles (%d resumable, %d cached)",
++            len(missing),
++            resume_count,
++            len(valid),
++        )
+@@ -268,14 +319,31 @@
+ 
+     paths: List[Path] = []
+     bad: List[str] = []
++    incomplete: List[str] = []
+     for name in names:
+         path = _tile_path(cache_dir, name)
+-        if _validate_raster(path):
++        if _aria2_control_path(path).exists():
++            incomplete.append(name)
++            continue
++        if _validate_raster(path, deep=True):
+             paths.append(path)
+         else:
+             bad.append(name)
++
++    if incomplete:
++        raise RuntimeError(
++            "COP30 download is still incomplete (aria2 control file remains): "
++            + ", ".join(incomplete[:10])
++        )
+     if bad:
+-        raise RuntimeError("Downloaded COP30 tiles failed validation: " + ", ".join(bad[:10]))
++        for name in bad:
++            _tile_path(cache_dir, name).unlink(missing_ok=True)
++        raise RuntimeError(
++            "Downloaded COP30 tiles failed full raster validation and were removed: "
++            + ", ".join(bad[:10])
++        )
+     return paths
