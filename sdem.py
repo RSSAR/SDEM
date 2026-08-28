@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""sdem.py - fast SAR DEM downloader powered by sardem + aria2.
+"""sdem.py - SAR-aware DEM wrapper around sardem.
 
-SDEM auto-detects the geographic extent of Sentinel-1 SAFE/ZIP products or
-NISAR RSLC HDF5 products, prefetches the required Copernicus GLO-30 tiles with
-aria2, builds a persistent local VRT, and delegates final DEM generation to
-sardem.
+SDEM adds SAR-product awareness on top of sardem:
 
-Typical use
------------
-    python sdem.py ../SLC
-    python sdem.py ../RSLC
+1. Detect a geographic extent from Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5.
+2. Select a suitable sardem DEM source automatically.
+3. For Copernicus DEMs, optionally accelerate downloads with aria2 and a
+   persistent local tile/VRT cache.
+4. Delegate DEM grid generation, reprojection and vertical-datum handling to
+   sardem.
 
-Auto mode:
-    Sentinel-1 -> ISCE2 DEM (dem.wgs84 + XML)
-    NISAR RSLC -> ISCE3 GeoTIFF (dem.tif)
+Auto mode
+---------
+    Sentinel-1 -> sardem COP source -> ISCE2 DEM
+    NISAR RSLC -> sardem NISAR source -> ISCE3 GeoTIFF
+
+Author: Shuai Wang
+Affiliation: China University of Mining and Technology
 """
 from __future__ import annotations
 
@@ -27,7 +30,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -44,7 +46,7 @@ COP30_RES = 1.0 / 3600.0
 COP30_HALF_PIXEL = 0.5 * COP30_RES
 
 BBox = Tuple[float, float, float, float]
-SDEM_VERSION = "1.0.3"
+SDEM_VERSION = "1.1.0"
 
 BANNER = r"""
    ███████╗██████╗ ███████╗███╗   ███╗
@@ -54,8 +56,8 @@ BANNER = r"""
    ███████║██████╔╝███████╗██║ ╚═╝ ██║
    ╚══════╝╚═════╝ ╚══════╝╚═╝     ╚═╝
 
-            Fast SAR DEM Downloader
-              Powered by sardem + aria2
+            SAR-aware DEM Downloader
+               Powered by sardem
 
    Developer : Shuai Wang
    Affiliation: China University of Mining and Technology
@@ -63,8 +65,8 @@ BANNER = r"""
 
 ASCII_BANNER = r"""
    S D E M
-   Fast SAR DEM Downloader
-   Powered by sardem + aria2
+   SAR-aware DEM Downloader
+   Powered by sardem
 
    Developer : Shuai Wang
    Affiliation: China University of Mining and Technology
@@ -106,13 +108,30 @@ def _get_sardem_utils():
     return utils
 
 
-def _get_sardem_cop_dem():
+def _get_sardem_dem():
     try:
-        from sardem import cop_dem
+        from sardem import dem
     except ImportError as exc:
         raise RuntimeError("sardem is required: python -m pip install -U sardem") from exc
-    return cop_dem
+    return dem
 
+
+def _ensure_sardem_source(source: str) -> None:
+    try:
+        from sardem.download import Downloader
+    except ImportError as exc:
+        raise RuntimeError("sardem is required: python -m pip install -U sardem") from exc
+    valid = {str(x).upper() for x in Downloader.VALID_SOURCES}
+    if source.upper() not in valid:
+        raise RuntimeError(
+            f"Installed sardem does not support data source {source!r}. "
+            "Upgrade sardem (NISAR support requires a recent sardem release)."
+        )
+
+
+# -----------------------------------------------------------------------------
+# Copernicus + aria2 acceleration
+# -----------------------------------------------------------------------------
 
 def _default_cache_dir() -> Path:
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -195,16 +214,34 @@ def _tile_url(name: str) -> str:
     return f"{COP30_BASE_URL}/{name}/{name}.tif"
 
 
-def _validate_raster(path: Path) -> bool:
+def _aria2_control_path(path: Path) -> Path:
+    return Path(str(path) + ".aria2")
+
+
+def _validate_raster(path: Path, deep: bool = True) -> bool:
+    """Validate cached TIFF and, when requested, force compressed blocks to decode."""
     if not path.exists() or path.stat().st_size <= 0:
+        return False
+    if _aria2_control_path(path).exists():
+        # aria2 sidecar means this is intentionally incomplete/resumable.
         return False
     try:
         gdal = _get_gdal()
         ds = gdal.Open(str(path), gdal.GA_ReadOnly)
-        ok = ds is not None and ds.RasterXSize > 0 and ds.RasterYSize > 0
+        if ds is None or ds.RasterXSize <= 0 or ds.RasterYSize <= 0 or ds.RasterCount <= 0:
+            ds = None
+            return False
+        if deep:
+            for band_idx in range(1, ds.RasterCount + 1):
+                band = ds.GetRasterBand(band_idx)
+                if band is None:
+                    ds = None
+                    return False
+                band.Checksum()  # Forces raster blocks to be decoded/read.
         ds = None
-        return bool(ok)
-    except Exception:
+        return True
+    except Exception as exc:
+        LOG.debug("Raster validation failed for %s: %s", path, exc)
         return False
 
 
@@ -225,21 +262,40 @@ def prefetch_tiles(
         raise RuntimeError("aria2c not found. Install it, e.g. sudo apt install aria2")
 
     valid: List[Path] = []
-    missing: List[Tuple[str, Path]] = []
+    pending: List[Tuple[str, Path]] = []
+    resume_count = 0
+
     for name in names:
         path = _tile_path(cache_dir, name)
-        if _validate_raster(path):
-            valid.append(path)
-        else:
-            if path.exists():
-                path.unlink(missing_ok=True)
-            missing.append((name, path))
+        control = _aria2_control_path(path)
 
-    if missing:
-        LOG.info("aria2: downloading %d COP30 tiles (%d cached)", len(missing), len(valid))
+        if control.exists():
+            # Preserve partial file and sidecar; aria2 will resume it.
+            resume_count += 1
+            pending.append((name, path))
+            LOG.info("aria2: resuming incomplete tile: %s", path.name)
+            continue
+
+        if _validate_raster(path, deep=True):
+            valid.append(path)
+            continue
+
+        if path.exists():
+            LOG.warning("Removing invalid cached tile: %s", path)
+            path.unlink(missing_ok=True)
+        control.unlink(missing_ok=True)
+        pending.append((name, path))
+
+    if pending:
+        LOG.info(
+            "aria2: downloading/resuming %d COP30 tiles (%d resumable, %d cached)",
+            len(pending),
+            resume_count,
+            len(valid),
+        )
         with tempfile.NamedTemporaryFile("w", suffix=".aria2.txt", delete=False) as f:
             input_file = Path(f.name)
-            for name, path in missing:
+            for name, path in pending:
                 f.write(_tile_url(name) + "\n")
                 f.write(f"  dir={path.parent}\n")
                 f.write(f"  out={path.name}\n")
@@ -268,14 +324,28 @@ def prefetch_tiles(
 
     paths: List[Path] = []
     bad: List[str] = []
+    incomplete: List[str] = []
     for name in names:
         path = _tile_path(cache_dir, name)
-        if _validate_raster(path):
+        if _aria2_control_path(path).exists():
+            incomplete.append(name)
+        elif _validate_raster(path, deep=True):
             paths.append(path)
         else:
             bad.append(name)
+
+    if incomplete:
+        raise RuntimeError(
+            "COP30 download is still incomplete (aria2 control file remains): "
+            + ", ".join(incomplete[:10])
+        )
     if bad:
-        raise RuntimeError("Downloaded COP30 tiles failed validation: " + ", ".join(bad[:10]))
+        for name in bad:
+            _tile_path(cache_dir, name).unlink(missing_ok=True)
+        raise RuntimeError(
+            "Downloaded COP30 tiles failed full raster validation and were removed: "
+            + ", ".join(bad[:10])
+        )
     return paths
 
 
@@ -320,10 +390,14 @@ def prepare_local_vrt(
     )
     key = _vrt_cache_key(bbox, names)
     vrt_path = cache_dir / "vrts" / f"cop30_{key}.vrt"
-    if not vrt_path.exists():
-        build_local_vrt(tile_paths, vrt_path)
+    # Always rebuild; it is cheap and ensures it only references validated tiles.
+    build_local_vrt(tile_paths, vrt_path)
     return vrt_path
 
+
+# -----------------------------------------------------------------------------
+# SAR extent detection
+# -----------------------------------------------------------------------------
 
 def _parse_s1_annotation_xml(xml_bytes: bytes) -> Tuple[List[float], List[float]]:
     root = ET.fromstring(xml_bytes)
@@ -504,6 +578,7 @@ def _extent_from_nisar_geolocation_grid(f) -> BBox:
     if not lons_all or not lats_all:
         raise ValueError("geolocationGrid coordinateX/coordinateY contains no finite values")
 
+    # This fallback is only safe when the grid stores geographic coordinates.
     lons = [v for v in lons_all if -360.1 <= v <= 360.1]
     lats = [v for v in lats_all if -90.1 <= v <= 90.1]
     if not lons or not lats:
@@ -659,8 +734,8 @@ def detect_sar_extent(path: Path) -> Tuple[str, BBox, int]:
                 msg += "\n" + details
             msg += (
                 "\nRun again with -v for debug logging. If these are subset/repacked RSLC files, "
-                "they must retain either identification/boundingPolygon or "
-                "RSLC/metadata/geolocationGrid/coordinateX and coordinateY."
+                "they must retain either identification/boundingPolygon or a usable "
+                "RSLC geolocation grid."
             )
             raise RuntimeError(msg)
         if failures:
@@ -670,6 +745,10 @@ def detect_sar_extent(path: Path) -> Tuple[str, BBox, int]:
 
     raise RuntimeError(f"No Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5 found under {path}")
 
+
+# -----------------------------------------------------------------------------
+# Backend selection / output
+# -----------------------------------------------------------------------------
 
 def _wrap_lon(lon: float) -> float:
     while lon > 180.0:
@@ -692,6 +771,15 @@ def buffer_bbox(bbox: BBox, buffer_deg: float) -> BBox:
         left = _wrap_lon(left - buffer_deg)
         right = _wrap_lon(right + buffer_deg)
     return left, bottom, right, top
+
+
+def select_dem_source(requested: str, detected_kind: str | None) -> str:
+    requested = requested.upper()
+    if requested != "AUTO":
+        return requested
+    if detected_kind == "nisar":
+        return "NISAR"
+    return "COP"
 
 
 def _resolve_outputs(fmt: str, output: str | None) -> Tuple[Path | None, Path | None]:
@@ -718,53 +806,57 @@ def _resolve_outputs(fmt: str, output: str | None) -> Tuple[Path | None, Path | 
     return Path(str(base) + ".wgs84"), Path(str(base) + ".tif")
 
 
-def run_sardem(bbox: BBox, local_vrt: Path, fmt: str, output: str | None = None) -> Tuple[Path | None, Path | None]:
-    import inspect
-
-    sardem_cop = _get_sardem_cop_dem()
+def run_sardem(
+    bbox: BBox,
+    dem_source: str,
+    fmt: str,
+    output: str | None = None,
+    local_vrt: Path | None = None,
+) -> Tuple[Path | None, Path | None]:
+    """Run sardem using the selected native data source."""
+    source = dem_source.upper()
+    _ensure_sardem_source(source)
+    sardem_dem = _get_sardem_dem()
     sardem_utils = _get_sardem_utils()
-    LOG.info("SDEM backend: sardem.cop_dem.download_and_stitch (local VRT)")
     isce2_path, isce3_path = _resolve_outputs(fmt, output)
 
-    sig = inspect.signature(sardem_cop.download_and_stitch)
-    if "vrt_filename" not in sig.parameters:
-        raise RuntimeError(
-            "Installed sardem is too old for SDEM's local-VRT workflow: "
-            "sardem.cop_dem.download_and_stitch() has no 'vrt_filename' parameter. "
-            "Install sardem >= 0.13.0."
-        )
+    vrt_filename = str(local_vrt) if local_vrt is not None else None
+    LOG.info("SDEM backend: sardem.dem.main(data_source=%s)", source)
 
     common = dict(
         bbox=bbox,
-        keep_egm=False,
+        data_source=source,
         xrate=1,
         yrate=1,
-        vrt_filename=str(local_vrt),
+        keep_egm=False,
         output_type="float32",
+        vrt_filename=vrt_filename,
     )
 
     if isce3_path is not None:
         isce3_path.parent.mkdir(parents=True, exist_ok=True)
-        LOG.info("Running sardem COP backend -> ISCE3 GeoTIFF: %s", isce3_path)
-        sardem_cop.download_and_stitch(
+        LOG.info("Running sardem %s backend -> ISCE3 GeoTIFF: %s", source, isce3_path)
+        sardem_dem.main(
             output_name=str(isce3_path),
             output_format="GTiff",
+            make_isce_xml=False,
             **common,
         )
 
     if isce2_path is not None:
         isce2_path.parent.mkdir(parents=True, exist_ok=True)
         if isce3_path is None:
-            LOG.info("Running sardem COP backend -> ISCE2 DEM: %s", isce2_path)
-            sardem_cop.download_and_stitch(
+            LOG.info("Running sardem %s backend -> ISCE2 DEM: %s", source, isce2_path)
+            sardem_dem.main(
                 output_name=str(isce2_path),
                 output_format="ENVI",
+                make_isce_xml=True,
                 **common,
             )
-            sardem_utils.gdal2isce_xml(str(isce2_path), keep_egm=False)
         else:
+            # Avoid downloading/warping twice in --format both mode.
             gdal = _get_gdal()
-            LOG.info("Translating sardem GeoTIFF -> ISCE2 ENVI: %s", isce2_path)
+            LOG.info("Translating GeoTIFF -> ISCE2 ENVI: %s", isce2_path)
             ds = gdal.Translate(
                 str(isce2_path),
                 str(isce3_path),
@@ -783,58 +875,100 @@ def run_sardem(bbox: BBox, local_vrt: Path, fmt: str, output: str | None = None)
 def build_parser() -> argparse.ArgumentParser:
     examples = r"""
 Examples:
-  # Sentinel-1 SAFE/ZIP directory -> ISCE2 DEM
+  # Sentinel-1 SAFE/ZIP -> COP DEM + aria2 -> ISCE2
   python sdem.py ../SLC
 
-  # NISAR RSLC HDF5 directory -> ISCE3 GeoTIFF
+  # NISAR RSLC HDF5 -> native NISAR DEM -> ISCE3
   python sdem.py ../RSLC
 
-  # Explicit output format
-  python sdem.py ../SLC --format isce3
-  python sdem.py ../SLC --format both
+  # Force a DEM source
+  python sdem.py ../RSLC --dem-source cop
+  python sdem.py ../SLC --dem-source nisar --format isce3
+  python sdem.py --bbox -118.43 33.71 -118.34 33.80 --dem-source 3dep
 
-  # Explicit bounding box [left bottom right top]
-  python sdem.py --bbox -118.43 33.71 -118.34 33.80
+  # Disable SDEM's aria2 acceleration and let sardem use its native COP VRT
+  python sdem.py ../SLC --no-aria2
 
-  # Smaller DEM buffer
-  python sdem.py ../RSLC --buffer 0.1
+  # Resume/parallelize Copernicus tile downloads
+  python sdem.py ../SLC --aria2-jobs 8 --aria2-connections 4
 
-  # More aria2 parallel downloads
-  python sdem.py ../RSLC --aria2-jobs 16 --aria2-connections 4
-
-  # Diagnose RSLC metadata / footprint parsing
-  python sdem.py ../RSLC -v --vrt-only
+  # COP-only: prefetch tiles and build local VRT without creating DEM
+  python sdem.py ../SLC --dem-source cop --vrt-only
 
 Auto mode:
-  Sentinel-1 -> ISCE2: dem.wgs84 + dem.wgs84.xml
-  NISAR RSLC -> ISCE3: dem.tif
+  Sentinel-1 -> DEM source COP   -> output ISCE2
+  NISAR RSLC -> DEM source NISAR -> output ISCE3
 
-DEM processing (pixel alignment, nodata handling and EGM2008 -> WGS84
-ellipsoidal heights) is performed by sardem. aria2 is only used to accelerate
-Copernicus GLO-30 tile download and provide a persistent local cache.
+SDEM extracts the SAR extent and selects the backend. Final DEM processing is
+performed by sardem. aria2 acceleration is used only for the COP source.
 """
     p = argparse.ArgumentParser(
         prog="sdem.py",
         description=(
-            "Fast Copernicus GLO-30 DEM downloader for Sentinel-1 and NISAR. "
-            "It auto-detects the SAR footprint, downloads required tiles with "
-            "aria2, and uses sardem for final DEM processing."
+            "SAR-aware wrapper for sardem. Auto-detect Sentinel-1/NISAR footprints, "
+            "select an appropriate DEM source, and create ISCE2/ISCE3 DEM products."
         ),
         epilog=examples,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("sar_path", nargs="?", default=None, help="SAR file/directory: Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5")
-    p.add_argument("--bbox", nargs=4, type=float, metavar=("LEFT", "BOTTOM", "RIGHT", "TOP"), help="Explicit bbox [left bottom right top]; overrides SAR metadata")
-    p.add_argument("--buffer-deg", "--buffer", type=float, default=0.2, help="Expand SAR bbox on all sides before DEM download (default: 0.2 deg)")
-    p.add_argument("--format", choices=["auto", "isce2", "isce3", "both"], default="auto", help="Output mode. auto: Sentinel-1 -> isce2, NISAR -> isce3")
-    p.add_argument("-o", "--output", help="Output path. Defaults: dem.wgs84 (isce2), dem.tif (isce3), or basename dem for both")
-    p.add_argument("--cache-dir", type=Path, default=None, help="Persistent Copernicus tile cache (default: ~/.cache/sdem/cop30)")
-    p.add_argument("--aria2-jobs", type=int, default=8, help="Concurrent tile downloads (default: 8)")
-    p.add_argument("--aria2-connections", type=int, default=4, help="Connections per tile (default: 4)")
-    p.add_argument("--refresh-tile-list", action="store_true", help="Refresh the cached Copernicus tile list")
-    p.add_argument("--vrt-only", action="store_true", help="Only prefetch tiles/build local VRT; do not run sardem")
-    p.add_argument("--version", action="version", version=f"SDEM {SDEM_VERSION}", help="Show SDEM version and exit")
-    p.add_argument("-v", "--verbose", action="store_true", help="Show verbose/debug logging, including skipped HDF5 reasons")
+    p.add_argument(
+        "sar_path",
+        nargs="?",
+        default=None,
+        help="SAR file/directory: Sentinel-1 SAFE/ZIP or NISAR RSLC HDF5",
+    )
+    p.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("LEFT", "BOTTOM", "RIGHT", "TOP"),
+        help="Explicit bbox [left bottom right top]; overrides SAR metadata",
+    )
+    p.add_argument(
+        "--buffer-deg",
+        "--buffer",
+        type=float,
+        default=0.2,
+        help="Expand SAR bbox on all sides before DEM generation (default: 0.2 deg)",
+    )
+    p.add_argument(
+        "--dem-source",
+        choices=["auto", "cop", "nisar", "3dep", "nasa"],
+        default="auto",
+        help="sardem DEM source. auto: Sentinel-1->COP, NISAR->NISAR",
+    )
+    p.add_argument(
+        "--format",
+        choices=["auto", "isce2", "isce3", "both"],
+        default="auto",
+        help="Output mode. auto: Sentinel-1->isce2, NISAR->isce3",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        help="Output path. Defaults: dem.wgs84 (isce2), dem.tif (isce3), basename dem for both",
+    )
+    p.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="SDEM Copernicus aria2 tile cache (default: ~/.cache/sdem/cop30)",
+    )
+    p.add_argument("--aria2-jobs", type=int, default=8, help="Concurrent COP tile downloads")
+    p.add_argument("--aria2-connections", type=int, default=4, help="Connections per COP tile")
+    p.add_argument("--refresh-tile-list", action="store_true", help="Refresh cached Copernicus tile list")
+    p.add_argument(
+        "--no-aria2",
+        action="store_true",
+        help="For COP source, bypass SDEM's aria2 cache and use sardem's native remote VRT",
+    )
+    p.add_argument(
+        "--vrt-only",
+        action="store_true",
+        help="COP+aria2 only: prefetch tiles/build local VRT and exit",
+    )
+    p.add_argument("--version", action="version", version=f"SDEM {SDEM_VERSION}")
+    p.add_argument("-v", "--verbose", action="store_true", help="Show verbose/debug logging")
     return p
 
 
@@ -843,7 +977,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _setup_logging(args.verbose)
 
-    detected_kind = None
+    detected_kind: str | None = None
     if args.bbox is not None:
         raw_bbox = tuple(map(float, args.bbox))
         LOG.info("Using explicit bbox: %s", raw_bbox)
@@ -856,34 +990,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     bbox = buffer_bbox(raw_bbox, args.buffer_deg)
     LOG.info("DEM bbox after %.3f deg buffer: %s", args.buffer_deg, bbox)
 
+    dem_source = select_dem_source(args.dem_source, detected_kind)
+    LOG.info("DEM source -> %s", dem_source)
+
     fmt = args.format
     if fmt == "auto":
-        if detected_kind == "sentinel1":
-            fmt = "isce2"
-        elif detected_kind == "nisar":
-            fmt = "isce3"
-        else:
-            fmt = "isce3"
+        fmt = "isce2" if detected_kind == "sentinel1" else "isce3"
         LOG.info("Auto output format -> %s", fmt)
 
-    local_vrt = prepare_local_vrt(
-        bbox=bbox,
-        cache_dir=args.cache_dir,
-        jobs=max(1, args.aria2_jobs),
-        connections_per_file=max(1, args.aria2_connections),
-        refresh_tile_list=args.refresh_tile_list,
-    )
-    LOG.info("Local Copernicus VRT: %s", local_vrt)
+    local_vrt: Path | None = None
+    if dem_source == "COP" and not args.no_aria2:
+        local_vrt = prepare_local_vrt(
+            bbox=bbox,
+            cache_dir=args.cache_dir,
+            jobs=max(1, args.aria2_jobs),
+            connections_per_file=max(1, args.aria2_connections),
+            refresh_tile_list=args.refresh_tile_list,
+        )
+        LOG.info("Local Copernicus VRT: %s", local_vrt)
+    elif dem_source == "COP":
+        LOG.info("COP source: aria2 acceleration disabled; using sardem native remote VRT")
+    else:
+        LOG.info("%s source uses sardem native backend; aria2 options are not used", dem_source)
 
     if args.vrt_only:
+        if dem_source != "COP" or args.no_aria2:
+            raise RuntimeError("--vrt-only requires --dem-source cop with aria2 enabled")
         print(local_vrt)
         return 0
 
     isce2_path, isce3_path = run_sardem(
         bbox=bbox,
-        local_vrt=local_vrt,
+        dem_source=dem_source,
         fmt=fmt,
         output=args.output,
+        local_vrt=local_vrt,
     )
 
     if isce2_path is not None:
