@@ -1,13 +1,13 @@
 cff-version: 1.2.0
 message: "If you use SDEM in your research, please cite this software."
-title: "SDEM: Fast SAR DEM Downloader"
+title: "SDEM: SAR-aware DEM Downloader"
 type: software
 authors:
   - family-names: Wang
     given-names: Shuai
     affiliation: China University of Mining and Technology
-version: 1.0.2
-date-released: 2026-08-25
+version: 1.1.0
+date-released: 2026-08-27
 license: MIT
 repository-code: "https://github.com/RSSAR/SDEM"
 url: "https://github.com/RSSAR/SDEM"
