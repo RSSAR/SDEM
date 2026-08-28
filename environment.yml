@@ -7,8 +7,9 @@ dependencies:
   - proj
   - aria2
   - h5py
+  - numpy
   - shapely
   - requests
   - pip
   - pip:
-      - sardem==0.13.0
+      - sardem>=0.13.0
