@@ -1,4 +1,4 @@
-sardem==0.13.0
+sardem>=0.13.0
 requests>=2.28
 h5py>=3.8
 numpy>=1.23
